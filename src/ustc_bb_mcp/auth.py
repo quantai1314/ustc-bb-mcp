@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -15,11 +16,26 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlsplit, urlunsplit
 import httpx
 from bs4 import BeautifulSoup
 
+from . import __version__
 from .config import BB_HOSTS, Settings, credentials, private_json
 from .errors import BBError
 
 PORTAL_PATH = "/webapps/portal/execute/tabs/tabAction?tab_tab_group_id=_2_1"
 CAS_HOSTS = frozenset({"passport.ustc.edu.cn", "id.ustc.edu.cn"})
+_TRANSIENT = frozenset({429, 500, 502, 503, 504})
+_RETRY_DELAYS = (0.5, 2.0)
+_MAX_RETRY_AFTER = 10.0
+
+log = logging.getLogger(__name__)
+
+
+def _retry_delay(response: httpx.Response | None, attempt: int) -> float:
+    """Honour a short Retry-After header; otherwise back off instead of hammering."""
+    delay = _RETRY_DELAYS[min(attempt, len(_RETRY_DELAYS) - 1)]
+    header = response.headers.get("Retry-After", "") if response is not None else ""
+    if header.strip().isdigit():
+        delay = max(delay, min(float(header), _MAX_RETRY_AFTER))
+    return delay
 
 
 def _login_page(source: str, url: str = "") -> bool:
@@ -92,7 +108,7 @@ class Session:
         self.client = client or httpx.AsyncClient(
             timeout=settings.timeout,
             follow_redirects=False,
-            headers={"User-Agent": "USTC-BB-MCP/0.1", "Accept-Language": "zh-CN,en;q=0.8"},
+            headers={"User-Agent": f"USTC-BB-MCP/{__version__}", "Accept-Language": "zh-CN,en;q=0.8"},
         )
         self._owns_client = client is None
         self._semaphore = asyncio.Semaphore(3)
@@ -227,14 +243,16 @@ class Session:
                     response = await self.client.request(
                         method, url, follow_redirects=False, timeout=self.settings.timeout, **kwargs
                     )
-                if response.status_code in {429, 500, 502, 503, 504} and attempt + 1 < attempts:
-                    await asyncio.sleep(0.1)
+                if response.status_code in _TRANSIENT and attempt + 1 < attempts:
+                    log.debug("transient HTTP %s on %s; retrying", response.status_code, urlsplit(url).path)
+                    await asyncio.sleep(_retry_delay(response, attempt))
                     continue
                 return response
             except httpx.RequestError as exc:
                 if attempt + 1 >= attempts:
                     raise BBError("network_error", "BB 请求失败或超时，请检查网络后重试。") from exc
-                await asyncio.sleep(0.1)
+                log.debug("request error %s on %s; retrying", type(exc).__name__, urlsplit(url).path)
+                await asyncio.sleep(_retry_delay(None, attempt))
         raise BBError("network_error", "BB 请求失败。")
 
     async def _follow(self, method: str, url: str, *, auth_redirect: bool = False, **kwargs) -> httpx.Response:
@@ -407,15 +425,16 @@ class Session:
                 try:
                     request = self.client.build_request("GET", current, timeout=self.settings.timeout)
                     response = await self.client.send(request, stream=True, follow_redirects=False)
-                    if response.status_code in {429, 500, 502, 503, 504} and attempt == 0:
+                    if response.status_code in _TRANSIENT and attempt == 0:
+                        delay = _retry_delay(response, attempt)
                         await response.aclose()
-                        await asyncio.sleep(0.1)
+                        await asyncio.sleep(delay)
                         continue
                     break
                 except httpx.RequestError as exc:
                     if attempt:
                         raise BBError("network_error", "课件下载连接失败或超时。") from exc
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(_retry_delay(None, attempt))
             if response is None:
                 raise BBError("network_error", "课件下载未返回响应。")
             if response.status_code not in {301, 302, 303, 307, 308}:

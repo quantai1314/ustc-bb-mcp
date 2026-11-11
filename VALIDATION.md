@@ -8,9 +8,21 @@
 
 项目位于 `D:\Project\ustc-bb-mcp`。初次安装已从空虚拟环境执行 `uv sync --frozen --python 3.11`，并完成 wheel 和源码包构建。本次登录与重交修复验证的是源码开发环境，没有重新打包或执行远端发布。
 
-最新完整回归 **157 项通过**，Ruff 和 `git diff --check` 通过。测试覆盖解析、认证、下载、真实 Chromium 与本地模拟站提交、9 个 MCP 工具的 schema、结构化返回和真实 stdio 握手。CI 已配置 Windows、macOS、Linux 及 Python 3.11、3.13 矩阵；远端执行结果仍以实际工作流为准。
+最新完整回归 **164 项通过**，Ruff 和 `git diff --check` 通过。测试覆盖解析、认证、下载、真实 Chromium 与本地模拟站提交、9 个 MCP 工具的 schema、注解、结构化返回和真实 stdio 握手。CI 已配置 Windows、macOS、Linux 及 Python 3.11、3.13 矩阵；远端执行结果仍以实际工作流为准。
 
 测试的页面、身份、回执及文件内容均为虚构数据；认证及提交测试使用模拟响应、本地站点或断网浏览器，不向真实课程提交。
+
+## 工程整理（2026-11-11）
+
+离线整理，没有访问真实 BB，也没有修改任何解析逻辑或提交流程的判定条件：
+
+- 仓库新增 `.gitattributes` 统一 LF 换行；此前 Windows 编辑器将 8 个文件改为 CRLF，造成 `git diff` 出现 1496 行无实际内容的改动，已恢复。CI 增加 `git diff --check`。
+- 9 个工具加上 MCP `ToolAnnotations`：查询类只读，下载类只写本机，`bb_submit_assignment` 是唯一非幂等的写入工具。`bb_assignment_details` 的 `download` 默认改为 `False`，避免模型在只想查看作业时下载全部附件。
+- `Blackboard` 增加进程内 60 秒缓存（`BB_CACHE_TTL`），缓存课程列表、完整的课程内容扫描和公告入口；按登录身份隔离，不完整的扫描不缓存，返回的对象是副本。`course="all"` 的作业和公告查询改为并发，HTTP 并发仍由会话的 3 路信号量限制。
+- 凭据库读取失败时返回 `credential_store_unavailable`，不再伪装成"未配置"；`doctor` 报告 `credential_store` 和版本号。临时错误重试改为 0.5s/2s 退避并遵循不超过 10 秒的 `Retry-After`。提交前检查文件大小（默认上限 200 MiB）和空文件。`BB_LOG_LEVEL=DEBUG` 只输出本项目脱敏后的请求路径。
+- 版本号改为从包元数据读取，`pyproject.toml` 是唯一来源；CLI 支持 `--version`。
+
+本次回归在 Linux 容器中执行（Python 3.11，Playwright chromium-headless-shell），164 项通过；Windows 本机以 CI 结果为准。
 
 ## 真实 BB 读取与初次只读验收
 

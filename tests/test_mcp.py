@@ -93,3 +93,15 @@ def test_cli_commands_and_safe_error(tmp_path):
     assert not result.stdout
     root = Path(__file__).resolve().parents[1]
     assert (root / "uv.lock").is_file()
+
+
+async def test_tool_annotations_distinguish_reads_from_the_single_write(tmp_path):
+    settings = Settings(data_dir=tmp_path / "state", output_dir=tmp_path / "out")
+    async with Client(create_server(settings)) as client:
+        tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+    read_only = {name for name, tool in tools.items() if tool.annotations.read_only_hint}
+    assert read_only == {"bb_list_courses", "bb_list_course_files", "bb_list_assignments", "bb_announcements"}
+    submit = tools["bb_submit_assignment"].annotations
+    assert submit.read_only_hint is False and submit.idempotent_hint is False
+    assert all(tool.annotations.destructive_hint is False for tool in tools.values())
+    assert tools["bb_assignment_details"].input_schema["properties"]["download"]["default"] is False

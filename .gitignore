@@ -6,10 +6,9 @@ __pycache__/
 dist/
 build/
 .env
-cred.json
-*storage_state*.json
+
+# Local runtime data is never committed (normally lives under BB_DATA_DIR).
 session.json
-profile/
-downloads/
-browser-profile/
 config.json
+*storage_state*.json
+browser-profile/

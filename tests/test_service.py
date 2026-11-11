@@ -50,7 +50,7 @@ def upload_form(assignment, course="_101_1"):
 
 
 def settings(tmp_path, **overrides):
-    return SimpleNamespace(base_url=BASE, output_dir=tmp_path, max_pages=500, **overrides)
+    return SimpleNamespace(**{"base_url": BASE, "output_dir": tmp_path, "max_pages": 500, "cache_ttl": 60, **overrides})
 
 
 def course(course_id="_101_1", title="数据结构"):
@@ -382,3 +382,65 @@ async def test_invalid_download_count_and_announcement_limit_fail_before_network
     with pytest.raises(BBError) as error:
         await service.announcements("all", limit=value)
     assert error.value.code == "invalid_argument"
+
+
+async def test_course_and_scan_cache_reuses_complete_results_per_identity(session_factory, tmp_path):
+    def handle(request):
+        if request.url.path == PORTAL:
+            return httpx.Response(200, text=portal(("_101_1", "数据结构")))
+        if request.url.path == LAUNCHER:
+            return httpx.Response(200, text=link(content_url("_1_1"), "资料"))
+        return httpx.Response(200, text=page(link("/bbcswebdav/a.pdf", "课件")))
+
+    now = [1000.0]
+    session = session_factory(handle)
+    service = Blackboard(session, settings(tmp_path), clock=lambda: now[0])
+    first = await service.list_files("_101_1")
+    requests_after_first = len(session.requests)
+    second = await service.list_files("_101_1")
+    assert first.data == second.data and second.complete
+    assert len(session.requests) == requests_after_first  # fully served from cache
+    # Mutating a returned item never leaks into the cache.
+    (await service.scan(course()))[0][0].name = "changed"
+    assert (await service.scan(course()))[0][0].name == "课件"
+    # The TTL expires and a different login identity never shares entries.
+    now[0] += 61
+    await service.list_files("_101_1")
+    assert len(session.requests) > requests_after_first
+    count = len(session.requests)
+    session.identity = "another-account"
+    await service.list_files("_101_1")
+    assert len(session.requests) > count
+    service.invalidate()
+    assert not service._cache
+
+
+async def test_incomplete_scan_is_never_cached(session_factory, tmp_path):
+    failures = [True]
+
+    def handle(request):
+        if request.url.path == PORTAL:
+            return httpx.Response(200, text=portal(("_101_1", "数据结构")))
+        if request.url.path == LAUNCHER:
+            return httpx.Response(200, text=link(content_url("_1_1"), "资料"))
+        if failures and failures.pop():
+            return httpx.Response(503)
+        return httpx.Response(200, text=page(link("/bbcswebdav/a.pdf", "课件")))
+
+    service = Blackboard(session_factory(handle), settings(tmp_path))
+    assert not (await service.list_files("_101_1")).complete
+    recovered = await service.list_files("_101_1")
+    assert recovered.complete and len(recovered.data["files"]) == 1
+
+
+async def test_cache_disabled_by_zero_ttl(session_factory, tmp_path):
+    def handle(request):
+        if request.url.path == PORTAL:
+            return httpx.Response(200, text=portal(("_101_1", "数据结构")))
+        return httpx.Response(200, text='<div id="courseMenuPalette_contents"></div>')
+
+    session = session_factory(handle)
+    service = Blackboard(session, settings(tmp_path, cache_ttl=0))
+    await service.list_courses()
+    await service.list_courses()
+    assert len(session.requests) == 2

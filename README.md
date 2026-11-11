@@ -49,6 +49,8 @@ uv run ustc-bb-mcp login --browser
 | `BB_OUTPUT_DIR` | 课件与附件的下载根目录 |
 | `BB_DATA_DIR` | 配置、会话和项目浏览器配置的保存目录 |
 | `BB_BASE_URL` | 可选 BB 入口，仅接受学校 `www.bb.ustc.edu.cn` 或 `bb.ustc.edu.cn` 的 HTTPS 地址 |
+| `BB_CACHE_TTL` | 课程列表和课程内容扫描在进程内的复用秒数，默认 60，设为 0 关闭缓存 |
+| `BB_LOG_LEVEL` | stderr 日志级别，默认 `WARNING`；`DEBUG` 只输出本项目脱敏后的请求路径，不输出依赖库日志 |
 
 环境变量中的密码不会由本项目写入配置文件。不要把密码加入仓库、共享的 MCP 配置示例或聊天消息。
 
@@ -84,16 +86,18 @@ uv run ustc-bb-mcp login --browser
 | `bb_list_course_files(course)` | 遍历课程全部可发现的内容区和嵌套目录，列出文件 |
 | `bb_download_courseware(course, keyword="", latest=2)` | 按文件名关键词筛选，下载最新的指定数量课件 |
 | `bb_list_assignments(course)` | 查询作业、测试入口、截止日期及可确认的状态；`course="all"` 查询全部课程 |
-| `bb_assignment_details(course, keyword="", download=True)` | 查询作业完整要求、附件、状态及可见成绩；默认会下载附件，设 `download=False` 可只查看 |
+| `bb_assignment_details(course, keyword="", download=False)` | 查询作业完整要求、附件列表、状态及可见成绩；设 `download=True` 才会把附件下载到本机 |
 | `bb_announcements(course, limit=8)` | 读取公告；`course="all"` 查询全部课程 |
 | `bb_submit_assignment(course, assignment, file_path, comment="", confirm=False, preview_token="")` | 为单个标准文件作业生成提交预览，再凭预览令牌确认提交 |
 
 课程与作业支持准确 ID、完整名称或唯一名称关键词。命中多项时会返回候选，不会自动选择第一项；后续调用请使用准确 ID。
 
+工具带有 MCP 注解：查询类工具标记为只读，下载类工具只写本机磁盘，`bb_submit_assignment` 是唯一会向 BB 写入的工具，客户端可据此决定是否弹出确认。课程列表和课程内容扫描结果在同一进程、同一登录身份内默认复用 60 秒，`course="all"` 的查询会并发读取各门课程；作业状态、公告正文和提交表单每次都实时读取。
+
 可以向客户端提出这些请求：
 
 - “列出我的课程，检查所有课程的作业提交状态，并附上原始链接。”
-- “查看数据结构最近的作业要求，先不要下载附件。”
+- “查看数据结构最近的作业要求，并把附件下载下来。”
 - “下载电磁学课程最新的两份 PDF 课件。”
 - “读取所有课程最近的公告，整理与考试有关的信息。”
 
@@ -130,7 +134,7 @@ uv run ustc-bb-mcp login --browser
 | 客户端提示找不到 `uv` | 使用 `uv` 可执行文件的绝对路径，并检查项目目录 |
 | 提示 Chromium 未安装 | 在项目目录运行 `uv run playwright install chromium` |
 | Linux 提示浏览器缺少共享库 | 运行 `uv run playwright install --with-deps chromium` |
-| 凭据库不可用或没有可用 backend | 使用 `login --browser`，或由安全的进程环境提供账号密码 |
+| 凭据库不可用或没有可用 backend（`doctor` 中 `credential_store` 为 `null`，或工具返回 `credential_store_unavailable`） | 使用 `login --browser`，或由安全的进程环境提供账号密码 |
 | 登录失败、需要验证码或二次认证 | 在浏览器确认账号能正常登录，再执行 `login --browser`；密码变更后重新 `configure` |
 | 工具反复提示未登录 | 确认客户端和配置命令使用同一用户及同一 `BB_DATA_DIR`，并检查校园网、代理和认证入口是否可达 |
 | 课程或作业关键词命中多项 | 从候选列表复制准确 ID 后重试 |
@@ -140,15 +144,18 @@ uv run ustc-bb-mcp login --browser
 
 ## 开发与验证
 
-本机最终检查：Python 3.11.15，157 项测试全部通过，Ruff 通过。初次适配时已完成 wheel 和源码包构建；本次修复验证的是源码开发环境。
+本地检查与 CI 执行相同的步骤；具体通过情况和真实环境验证记录见 [VALIDATION.md](VALIDATION.md)。
 
 ```powershell
 uv sync --frozen
 uv run playwright install chromium
 uv run ruff check .
 uv run pytest -q
+git diff --check
 uv build
 ```
+
+仓库通过 `.gitattributes` 统一使用 LF 换行。Windows 编辑器如果把文件改成 CRLF，`git diff` 会显示整文件改动，请在提交前恢复 LF。
 
 自动化测试使用虚构页面、模拟响应和本地测试站，不需要学校账号，也不会访问真实课程或提交作业。测试覆盖页面解析、状态判定、附件下载、认证边界、MCP 协议以及提交预览与回执处理。CI 配置了 Windows、macOS、Linux 与 Python 3.11、3.13 的验证矩阵；远端执行结果以实际工作流为准。
 

@@ -73,7 +73,15 @@ class Submitter:
             path = Path(file_path).expanduser().resolve()
             if not path.is_file():
                 raise BBError("file_not_found", "待提交文件不存在或不是普通文件。")
+            limit = self.service.settings.max_upload_bytes
             try:
+                size = path.stat().st_size
+                if size > limit:
+                    # The whole file is held in memory for hashing and upload.
+                    raise BBError("file_too_large", f"待提交文件 {size} 字节，超过 {limit} 字节上限。",
+                                  details={"bytes": size, "limit": limit})
+                if size == 0:
+                    raise BBError("file_empty", "待提交文件为空，未生成预览。")
                 payload = await asyncio.to_thread(path.read_bytes)
             except OSError as exc:
                 raise BBError("local_io_error", "无法读取待提交文件。") from exc

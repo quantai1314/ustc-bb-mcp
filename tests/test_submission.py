@@ -377,3 +377,17 @@ async def test_submit_response_timeout_reads_history_without_reposting(rig, beha
         await confirm(rig, token)
     assert error.value.code == "preview_required"
     assert len(rig.server.state.posts) == 1
+
+
+async def test_oversized_or_empty_file_is_rejected_before_any_request(rig):
+    rig.service.settings.max_upload_bytes = 8
+    with pytest.raises(BBError) as failure:
+        await preview(rig)
+    assert failure.value.code == "file_too_large"
+    assert failure.value.details["limit"] == 8
+    rig.path.write_bytes(b"")
+    rig.service.settings.max_upload_bytes = 1024
+    with pytest.raises(BBError) as failure:
+        await preview(rig)
+    assert failure.value.code == "file_empty"
+    assert rig.server.state.download_requests == []

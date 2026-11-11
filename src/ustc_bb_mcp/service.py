@@ -1,6 +1,7 @@
 """Blackboard read operations; content is data, never instructions for the agent."""
 
 import asyncio
+import time
 from collections import Counter, deque
 from urllib.parse import urlencode, urljoin, urlsplit
 
@@ -44,20 +45,44 @@ def choose(items, query: str, label: str):
 
 
 class Blackboard:
-    def __init__(self, session, settings):
+    def __init__(self, session, settings, *, clock=time.monotonic):
         self.session = session
         self.settings = settings
         self.downloader = Downloader(session, settings.output_dir)
+        self.clock = clock
+        # Short-lived read cache: the course list and content-tree scans are
+        # fetched by almost every tool, and `course="all"` repeats them per course.
+        # Entries are keyed by the authenticated identity so a re-login never
+        # serves another account's data. Only complete results are cached.
+        self._cache: dict[tuple, tuple[float, object]] = {}
 
     def url(self, path):
         return urljoin(self.settings.base_url + "/", path)
 
+    def _cached(self, *key):
+        entry = self._cache.get((self.session.identity, *key))
+        if entry and entry[0] > self.clock():
+            return entry[1]
+        return None
+
+    def _remember(self, value, *key):
+        if self.settings.cache_ttl > 0:
+            self._cache[(self.session.identity, *key)] = (self.clock() + self.settings.cache_ttl, value)
+        return value
+
+    def invalidate(self) -> None:
+        self._cache.clear()
+
     async def courses(self) -> list[Course]:
+        cached = self._cached("courses")
+        if cached is not None:
+            return [course.model_copy() for course in cached]
         response = await self.session.get(self.url(PORTAL))
         courses = parse_courses(response.text, str(response.url))
         if not courses and not any(word in response.text for word in ("无课程", "未注册", "No courses", "not enrolled")):
             raise BBError("layout_changed", "门户中未识别到课程，不能确认账号没有课程。")
-        return courses
+        self._remember(courses, "courses")
+        return [course.model_copy() for course in courses]
 
     async def list_courses(self) -> Result:
         courses = await self.courses()
@@ -67,6 +92,20 @@ class Blackboard:
         return choose(await self.courses(), query, "课程")
 
     async def scan(self, course):
+        cached = self._cached("scan", course.id)
+        if cached is not None:
+            files, assignments, announcement_url = cached
+            return ([f.model_copy() for f in files], [a.model_copy(deep=True) for a in assignments],
+                    announcement_url, [])
+        result = await self._scan(course)
+        files, assignments, announcement_url, warnings = result
+        if not warnings:
+            self._remember((files, assignments, announcement_url), "scan", course.id)
+            return ([f.model_copy() for f in files], [a.model_copy(deep=True) for a in assignments],
+                    announcement_url, [])
+        return result
+
+    async def _scan(self, course):
         response = await self.session.get(course.url)
         roots, announcement_url = parse_course_menu(response.text, str(response.url))
         # Some courses open straight into a content area.
@@ -164,14 +203,20 @@ class Blackboard:
     async def list_assignments(self, course_query):
         courses = await self.courses()
         selected = courses if course_query.strip().casefold() == "all" else [choose(courses, course_query, "课程")]
-        items, warnings = [], []
-        for course in selected:
+
+        async def one(course):
             try:
                 assignments, notices = await self.assignments(course)
-                items.extend({**a.model_dump(), "course_name": course.name} for a in assignments)
-                warnings.extend(notices)
+                return [{**a.model_dump(), "course_name": course.name} for a in assignments], notices
             except BBError as error:
-                warnings.append(f"{course.name}：查询失败（{error.code}）。")
+                return [], [f"{course.name}：查询失败（{error.code}）。"]
+
+        # Courses are read concurrently; the session semaphore bounds real
+        # HTTP concurrency, and results keep the portal's course order.
+        items, warnings = [], []
+        for course_items, notices in await asyncio.gather(*(one(course) for course in selected)):
+            items.extend(course_items)
+            warnings.extend(notices)
         return Result(message=f"读取到 {len(items)} 项作业或测试入口。", data={"assignments": items}, complete=not warnings, warnings=warnings)
 
     async def detail(self, assignment):
@@ -185,7 +230,7 @@ class Blackboard:
         detail.attachments = list({f.id: f for f in [*assignment.attachments, *detail.attachments]}.values())
         return detail
 
-    async def assignment_details(self, course_query, keyword="", download=True):
+    async def assignment_details(self, course_query, keyword="", download=False):
         course = await self.select_course(course_query)
         _, items, _, warnings = await self.scan(course)
         if keyword:
@@ -213,19 +258,28 @@ class Blackboard:
             raise BBError("invalid_argument", "limit 应为 1 到 1000 的整数。")
         courses = await self.courses()
         selected = courses if course_query.strip().casefold() == "all" else [choose(courses, course_query, "课程")]
-        announcements, warnings = [], []
-        for course in selected:
+
+        async def one(course):
             try:
-                response = await self.session.get(course.url)
-                _, target = parse_course_menu(response.text, str(response.url))
-                if not target:
-                    # Blackboard's standard course-scoped announcement reader.
-                    target = self.url("/webapps/blackboard/execute/announcement?" + urlencode({"method": "search", "context": "course", "course_id": course.id, "viewChoice": 3}))
+                target = self._cached("announcement_url", course.id)
+                if target is None:
+                    response = await self.session.get(course.url)
+                    _, target = parse_course_menu(response.text, str(response.url))
+                    if not target:
+                        # Blackboard's standard course-scoped announcement reader.
+                        target = self.url("/webapps/blackboard/execute/announcement?" + urlencode({"method": "search", "context": "course", "course_id": course.id, "viewChoice": 3}))
+                    self._remember(target, "announcement_url", course.id)
                 page = await self.session.get(target)
                 items = parse_announcements(page.text, str(page.url), course.id)
+                notices = []
                 if not items and not any(marker in page.text for marker in ("announcementList", "announcement_list", "没有公告", "无公告", "No announcements")):
-                    warnings.append(f"{course.name}：未识别到公告列表结构，不能确认没有公告。")
-                announcements.extend({**a.model_dump(), "course_name": course.name} for a in items[:limit])
+                    notices.append(f"{course.name}：未识别到公告列表结构，不能确认没有公告。")
+                return [{**a.model_dump(), "course_name": course.name} for a in items[:limit]], notices
             except BBError as error:
-                warnings.append(f"{course.name}：公告读取失败（{error.code}）。")
+                return [], [f"{course.name}：公告读取失败（{error.code}）。"]
+
+        announcements, warnings = [], []
+        for course_items, notices in await asyncio.gather(*(one(course) for course in selected)):
+            announcements.extend(course_items)
+            warnings.extend(notices)
         return Result(message=f"读取到 {len(announcements)} 条公告。", data={"announcements": announcements}, complete=not warnings, warnings=warnings)

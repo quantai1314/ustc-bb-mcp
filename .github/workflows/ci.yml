@@ -32,6 +32,9 @@ jobs:
         run: uv run playwright install chromium
       - name: Lint
         run: uv run ruff check .
+      - name: Whitespace and line endings
+        # Compare the whole tree against git's empty tree so a shallow checkout works.
+        run: git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904 HEAD
       - name: Test with local fixtures and browser
         run: uv run pytest -q
       - name: Build package

@@ -9,6 +9,8 @@ from ustc_bb_mcp.errors import BBError
 
 
 class FixtureSession:
+    identity = "fixture-session-identity"
+
     def __init__(self, handler):
         self.requests = []
 

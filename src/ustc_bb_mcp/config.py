@@ -43,6 +43,8 @@ class Settings:
     output_dir: Path = field(default_factory=lambda: Path.home() / "Downloads" / "USTC-BB")
     timeout: float = 30
     max_pages: int = 500
+    cache_ttl: float = 60  # seconds to reuse course lists and content scans; 0 disables
+    max_upload_bytes: int = 200 * 1024 * 1024
     username: str = ""
     test_mode: bool = False
 
@@ -65,6 +67,8 @@ class Settings:
         self.base_url = self.base_url.rstrip("/")
         if self.timeout <= 0 or self.max_pages <= 0:
             raise BBError("invalid_config", "超时和扫描页数必须大于零。")
+        if self.cache_ttl < 0 or self.max_upload_bytes <= 0:
+            raise BBError("invalid_config", "缓存时间不能为负，上传大小上限必须大于零。")
 
     @property
     def state_path(self) -> Path:
@@ -90,10 +94,15 @@ class Settings:
                     raise ValueError
             except (OSError, ValueError) as exc:
                 raise BBError("invalid_config", "本地 config.json 无法读取，请重新运行 configure。") from exc
+        try:
+            cache_ttl = float(os.environ.get("BB_CACHE_TTL", config.get("cache_ttl", 60)))
+        except (TypeError, ValueError) as exc:
+            raise BBError("invalid_config", "BB_CACHE_TTL 必须是秒数。") from exc
         return cls(
             base_url=os.environ.get("BB_BASE_URL", config.get("base_url", "https://www.bb.ustc.edu.cn")),
             data_dir=data_dir,
             output_dir=Path(os.environ.get("BB_OUTPUT_DIR", config.get("output_dir", str(Path.home() / "Downloads" / "USTC-BB")))),
+            cache_ttl=cache_ttl,
             username=os.environ.get("USTC_CAS_USR", config.get("username", "")).strip(),
         )
 
@@ -120,10 +129,16 @@ def credentials(settings: Settings) -> tuple[str, str]:
     username = os.environ.get("USTC_CAS_USR", settings.username).strip()
     password = os.environ.get("USTC_CAS_PWD", "")
     if not password and username:
+        # A broken credential store is a different problem from "not configured
+        # yet"; say so instead of asking the user to run configure again.
+        backend = _secure_keyring()
         try:
-            password = _secure_keyring().get_password(KEYRING_SERVICE, username) or ""
-        except Exception:
-            password = ""
+            password = backend.get_password(KEYRING_SERVICE, username) or ""
+        except Exception as exc:
+            raise BBError(
+                "credential_store_unavailable",
+                "无法从系统凭据库读取密码。请重新运行 configure，或使用 login --browser / USTC_CAS_PWD。",
+            ) from exc
     return username, password
 
 

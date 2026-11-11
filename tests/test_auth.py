@@ -567,3 +567,43 @@ async def test_cas_failure_does_not_expose_exception(settings, monkeypatch):
             await session._cas_login("student", "password")
     assert error.value.code == "interaction_required"
     assert "private" not in str(error.value)
+
+
+async def test_transient_retry_honours_short_retry_after(settings, monkeypatch):
+    delays = []
+
+    async def sleep(seconds):
+        delays.append(seconds)
+
+    monkeypatch.setattr(auth.asyncio, "sleep", sleep)
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(429, headers={"Retry-After": "3"})
+        return httpx.Response(200, text="content")
+
+    async with client_for(handler) as client:
+        session = Session(settings, client)
+        session._authenticated = True
+        assert (await session.get("/file")).text == "content"
+    assert delays == [3.0]
+    # An absurd Retry-After is capped so a tool call cannot hang for minutes.
+    assert auth._retry_delay(httpx.Response(503, headers={"Retry-After": "600"}), 0) == auth._MAX_RETRY_AFTER
+    assert auth._retry_delay(None, 0) == auth._RETRY_DELAYS[0]
+
+
+def test_broken_credential_store_is_reported_not_hidden(settings, monkeypatch):
+    class Backend:
+        def get_password(self, service, username):
+            raise RuntimeError("locked")
+
+    monkeypatch.delenv("USTC_CAS_PWD", raising=False)
+    monkeypatch.setenv("USTC_CAS_USR", "student")
+    monkeypatch.setattr(config, "_secure_keyring", lambda: Backend())
+    with pytest.raises(BBError) as failure:
+        credentials(settings)
+    assert failure.value.code == "credential_store_unavailable"
+    assert "locked" not in failure.value.message
