@@ -208,6 +208,40 @@ def test_preallocated_attempt_id_survives_successful_history_without_receipt_num
     }]
 
 
+def test_history_exposes_target_bound_new_attempt_without_opening_it():
+    target = f"/webapps/assignment/uploadAssignment?action=newAttempt&course_id={COURSE}&content_id=_3_1"
+    html = f'''<h1 id="pageTitleText">复查提交历史记录</h1>
+    <input name="attempt_id" value="_11_1"><span id="confirmationNumber">MOCK-1111</span>
+    <input type="submit" name="bottom_开始新的" value="开始新的" onclick="document.location='{target}';">'''
+    info = submission_form(html, ASSIGNMENT)
+    assert info["can_start_new_attempt"] and not info["can_submit"]
+    assert info["new_attempt_url"] == BASE + target
+    assert info["new_attempt_selector"] == 'input[name="bottom_开始新的"]'
+
+
+@pytest.mark.parametrize("change", ["foreign", "course", "assignment", "action", "disabled", "script"])
+def test_new_attempt_control_must_be_enabled_and_bound_to_current_assignment(change):
+    target = f"{BASE}/webapps/assignment/uploadAssignment?action=newAttempt&course_id={COURSE}&content_id=_3_1"
+    disabled = ""
+    if change == "foreign":
+        target = target.replace(BASE, "https://foreign.invalid")
+    elif change == "course":
+        target = target.replace(COURSE, "_999_1")
+    elif change == "assignment":
+        target = target.replace("_3_1", "_999_1")
+    elif change == "action":
+        target = target.replace("newAttempt", "deleteAttempt")
+    elif change == "disabled":
+        disabled = "disabled"
+    onclick = f"document.location='{target}';"
+    if change == "script":
+        onclick = "doSomething();" + onclick
+    html = f'''<h1 id="pageTitleText">Review Submission History</h1>
+    <input name="attempt_id" value="_11_1"><span id="confirmationNumber">MOCK-1111</span>
+    <input type="submit" name="start" value="Start New" {disabled} onclick="{onclick}">'''
+    assert not submission_form(html, ASSIGNMENT)["can_start_new_attempt"]
+
+
 def test_submitted_file_evidence_requires_actual_same_origin_download_links():
     html = '''<h1 id="pageTitleText">Review Submission History</h1>
     <div id="submittedFiles"><a href="/bbcswebdav/instructions.pdf">instructions.pdf</a></div>

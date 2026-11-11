@@ -336,10 +336,177 @@ async def test_browser_guard_allows_https_captcha_assets_but_bounds_navigation(u
         async def abort(self):
             self.outcome = "abort"
         async def continue_(self, **kwargs):
-            self.outcome = "upgrade" if kwargs.get("url", "").startswith("https://") else "continue"
+            assert not kwargs
+            self.outcome = "continue"
+        async def fulfill(self, *, status, headers, body):
+            assert status == 307
+            assert headers["Location"] == url.replace("http://", "https://", 1)
+            assert body == ""
+            self.outcome = "upgrade"
     route = Route()
     await auth._browser_route(route)
     assert route.outcome == expected
+
+
+async def test_browser_guard_upgrades_legacy_callback_with_real_chromium():
+    from playwright.async_api import Error, async_playwright
+
+    original = "http://www.bb.ustc.edu.cn/callback?ticket=fictional"
+    upgraded = original.replace("http://", "https://", 1)
+    requests, responses, routing_errors = [], [], []
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        # Redirected requests bypass route handlers. Offline mode guarantees
+        # that even the HTTPS redirect cannot reach the real school website.
+        context = await browser.new_context(offline=True)
+        try:
+            async def handle(route):
+                try:
+                    await auth._browser_route(route)
+                except Error as error:
+                    routing_errors.append(str(error))
+
+            await context.route("**/*", handle)
+            page = await context.new_page()
+            page.on("request", lambda request: requests.append(request.url))
+            page.on("response", lambda response: responses.append(response))
+            with pytest.raises(Error):
+                await page.goto(original, timeout=3000)
+
+            assert routing_errors == []
+            assert requests == [original, upgraded]
+            assert len(responses) == 1
+            assert responses[0].status == 307
+            assert (await responses[0].all_headers())["location"] == upgraded
+        finally:
+            await context.close()
+            await browser.close()
+
+
+@pytest.mark.parametrize("failing_check", ["count", "visibility"])
+async def test_login_entry_navigation_race_keeps_window_available(failing_check):
+    from types import SimpleNamespace
+
+    from playwright.async_api import Error
+
+    class Link:
+        @property
+        def first(self):
+            return self
+
+        async def count(self):
+            if failing_check == "count":
+                raise Error("Document was replaced during navigation")
+            return 1
+
+        async def is_visible(self):
+            raise Error("Document was replaced during navigation")
+
+        async def click(self, **kwargs):
+            pytest.fail("A replaced document must not be clicked")
+
+    page = SimpleNamespace(url="https://www.bb.ustc.edu.cn/", get_by_role=lambda *a, **k: Link())
+    await auth._advance_login_entry(page)
+
+
+async def test_browser_login_survives_handoff_and_probe_failure_without_reopening(settings, monkeypatch):
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    import playwright.async_api
+    from playwright.async_api import Error
+
+    events = []
+    replacement = SimpleNamespace(url="https://www.bb.ustc.edu.cn/?step=0")
+
+    class InitialPage:
+        async def goto(self, *args, **kwargs):
+            context.pages = [replacement]
+            raise Error("Initial page was closed after opening the authentication page")
+
+    class Context:
+        pages = [InitialPage()]
+
+        async def route(self, *args):
+            pass
+
+        async def storage_state(self):
+            pytest.fail("Polling storage_state would create transient SSO tabs")
+
+        async def cookies(self):
+            events.append("cookies")
+            replacement.url = f"https://www.bb.ustc.edu.cn/?step={len(events)}"
+            return []
+
+        async def close(self):
+            events.append("close")
+
+    context = Context()
+
+    async def launch(*args, **kwargs):
+        events.append("launch")
+        return context
+
+    @asynccontextmanager
+    async def manager():
+        yield SimpleNamespace(chromium=SimpleNamespace(launch_persistent_context=launch))
+
+    async def advance(page):
+        events.append("advance")
+
+    async def sleep(seconds):
+        pass
+
+    monkeypatch.setattr(playwright.async_api, "async_playwright", manager)
+    monkeypatch.setattr(auth, "_advance_login_entry", advance)
+    monkeypatch.setattr(auth.asyncio, "sleep", sleep)
+    async with client_for(lambda r: httpx.Response(200)) as client:
+        session = Session(settings, client)
+        probes = iter([BBError("network_error", "Temporary outage"), False, True])
+
+        async def probe():
+            events.append("probe")
+            value = next(probes)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        async def save():
+            assert "close" not in events
+            events.append("save")
+
+        monkeypatch.setattr(session, "_probe", probe)
+        monkeypatch.setattr(session, "_save_state", save)
+        assert (await session.login_browser())["authenticated"]
+
+    assert events == ["launch", "advance", "cookies", "probe", "cookies", "probe", "cookies", "probe", "save", "close"]
+
+
+async def test_browser_login_failure_reports_safe_stage(settings, monkeypatch):
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    import playwright.async_api
+
+    async def launch(*args, **kwargs):
+        raise RuntimeError("net::ERR_CONNECTION_RESET https://school.test/?ticket=secret password=private")
+
+    @asynccontextmanager
+    async def manager():
+        yield SimpleNamespace(chromium=SimpleNamespace(launch_persistent_context=launch))
+
+    monkeypatch.setattr(playwright.async_api, "async_playwright", manager)
+    async with client_for(lambda r: httpx.Response(200)) as client:
+        with pytest.raises(BBError) as failure:
+            await Session(settings, client).login_browser()
+    assert failure.value.as_dict() == {
+        "code": "browser_login_failed",
+        "message": "浏览器登录未完成，请根据失败阶段检查；未自动重新打开窗口。",
+        "stage": "browser_launch",
+        "exception_type": "RuntimeError",
+        "network_error": "net::ERR_CONNECTION_RESET",
+    }
 
 
 async def test_two_stage_cas_and_legacy_http_service(settings, monkeypatch):

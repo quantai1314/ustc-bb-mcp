@@ -27,6 +27,10 @@ class State:
     browser_changed: bool = False
     comment_available: bool = True
     download_requests: list[dict] = field(default_factory=list)
+    allow_new_attempt: bool = False
+    new_attempts: int = 0
+    history_delay_reads: int = 0
+    history_reads: int = 0
     posted: threading.Event = field(default_factory=threading.Event)
 
 
@@ -78,8 +82,19 @@ class MockBlackboard:
                     return
                 course_id = params.get("course_id", ["_1_1"])[0]
                 assignment_id = params.get("content_id", ["_2_1"])[0]
+                if params.get("action") == ["newAttempt"]:
+                    if not owner.state.allow_new_attempt or not owner.state.enabled:
+                        self.send_html("<h1>Attempt unavailable</h1>", 403)
+                        return
+                    owner.state.new_attempts += 1
+                    if owner.state.behavior != "new_attempt_old_history":
+                        owner.state.submitted = False
                 if owner.state.submitted and owner.state.accepted:
-                    self.send_html(owner.receipt(course_id, assignment_id))
+                    owner.state.history_reads += 1
+                    if owner.state.history_reads <= owner.state.history_delay_reads:
+                        self.send_html(owner.form(course_id, assignment_id))
+                    else:
+                        self.send_html(owner.receipt(course_id, assignment_id))
                 else:
                     browser = "Chrome/" in self.headers.get("User-Agent", "")
                     self.send_html(owner.form(course_id, assignment_id, browser=browser))
@@ -146,6 +161,8 @@ class MockBlackboard:
         initial_attempt = "_10_1" if self.state.behavior in {
             "success_same_attempt", "timeout_saved", "old_attempt_same_name", "old_attempt_identical_bytes",
         } else ""
+        if self.state.new_attempts:
+            initial_attempt = "_21_1"
         comment = '<textarea name="student_commentstext" id="student_commentstext"></textarea>' if self.state.comment_available else ""
         return f'''<!doctype html><html><head><meta charset="utf-8"></head><body>
         <h1 id="pageTitleText">Upload Assignment: Fictional report</h1>
@@ -164,7 +181,9 @@ class MockBlackboard:
         posted = self.state.accepted
         filename = posted["files"][0]["name"] if posted and posted["files"] else "missing"
         attempt_id = "_20_1"
-        if self.state.behavior in {"success_same_attempt", "timeout_saved"}:
+        if self.state.new_attempts and self.state.behavior not in {"new_attempt_old_history", "resubmit_old_receipt"}:
+            attempt_id = "_21_1"
+        elif self.state.behavior in {"success_same_attempt", "timeout_saved"}:
             attempt_id = "_10_1"
         elif self.state.behavior in {"old_attempt_same_name", "old_attempt_identical_bytes"}:
             attempt_id = "_9_1"
@@ -172,13 +191,23 @@ class MockBlackboard:
         href = "/webapps/assignment/download?" + urlencode({
             "course_id": course_id, "attempt_id": attempt_id, "file_id": "_30_1", "fileName": filename,
         })
+        new_attempt = ""
+        if self.state.allow_new_attempt and self.state.enabled:
+            target = "/webapps/assignment/uploadAssignment?" + urlencode({
+                "action": "newAttempt", "course_id": course_id, "content_id": assignment_id,
+            })
+            new_attempt = f'''<input type="submit" name="bottom_StartNew" value="Start New"
+                onclick="document.location='{html.escape(target)}';">'''
         return f'''<!doctype html><html><head><meta charset="utf-8"></head><body>
         <h1 id="pageTitleText">Review Submission History: Fictional report</h1>
+        <div class="vtbegenerated">{html.escape(self.state.requirements)}</div>
+        <p>Due Date: November 30, 2026 11:59 PM</p>
         <input type="hidden" name="course_id" value="{html.escape(course_id)}">
         <input type="hidden" name="content_id" value="{html.escape(assignment_id)}">
         <input type="hidden" name="attempt_id" value="{attempt_id}">
         <div id="submittedFiles"><a href="{html.escape(href)}">{html.escape(filename)}</a></div>
         {confirmation}
+        {new_attempt}
         <p>Submission received.</p></body></html>'''
 
     def close(self):

@@ -414,6 +414,31 @@ def submission_form(html: str, url: str) -> dict:
     title = _text(soup.select_one("#pageTitleText"))
     has_receipt = bool(receipt or re.search(r"successfully submitted|submission (?:was )?received|提交成功|已成功提交", text, re.I)
                        or (attempt_id and existing and re.search(r"复查提交历史记录|review submission history", title, re.I)))
+    new_attempts = []
+    for control in soup.select('input[type="submit"], input[type="button"], button, a[href]'):
+        label = normalize_name(str(control.get("value") or _text(control)))
+        if (control.has_attr("disabled") or control.get("aria-disabled") == "true"
+            or not re.fullmatch(r"开始新的|开始新尝试|Start New(?: Attempt)?", label, re.I)
+            or control.find_parent(class_="vtbegenerated")):
+            continue
+        target = str(control.get("href") or "")
+        if not target:
+            location = re.fullmatch(
+                r"\s*(?:document|window)\.location(?:\.href)?\s*=\s*(['\"])([^'\"]+)\1\s*;?\s*",
+                str(control.get("onclick") or ""),
+            )
+            target = location[2] if location else ""
+        target = _url(url, target) if target else ""
+        destination, origin = urlsplit(target), urlsplit(url)
+        query = _params(target)
+        selector = _selector(control, control.name)
+        if (selector and (destination.scheme, destination.netloc) == (origin.scheme, origin.netloc)
+            and destination.path == "/webapps/assignment/uploadAssignment"
+            and query.get("action", "").casefold() == "newattempt"
+            and query.get("course_id") == course_id and query.get("content_id") == assignment_id
+            and not query.get("group_id")):
+            new_attempts.append((selector, target))
+    new_attempt = new_attempts[0] if len(new_attempts) == 1 else (None, None)
     return {
         "action": action, "form_id": form.get("id") if form else None,
         "file_input": _selector(files[0], "input") if files else None,
@@ -424,6 +449,8 @@ def submission_form(html: str, url: str) -> dict:
         "submit_selector": _selector(submit, submit.name) if submit else None,
         "hidden_fields": {el["name"]: el.get("value", "") for el in context.select('input[type="hidden"][name]')} if form else {},
         "can_submit": bool(form and files and submit is not None and course_id and assignment_id and not is_test and not is_group),
+        "can_start_new_attempt": bool(has_receipt and attempt_id and new_attempt[0] and not is_test and not is_group),
+        "new_attempt_selector": new_attempt[0], "new_attempt_url": new_attempt[1],
         "course_id": course_id, "assignment_id": assignment_id,
         "history_links": list(dict.fromkeys(history)), "existing_files": list(dict.fromkeys(existing)),
         "submitted_files": list(submitted_files.values()),

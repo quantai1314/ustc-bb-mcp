@@ -7,7 +7,7 @@ import mimetypes
 import secrets
 import time
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from .errors import BBError
 from .models import Result
@@ -17,7 +17,8 @@ from .service import choose
 
 def _snapshot(form: dict, detail) -> str:
     fields = ("course_id", "assignment_id", "attempt_id", "can_submit", "is_group",
-              "file_input", "comment_input", "submit_selector", "receipt_id")
+              "file_input", "comment_input", "submit_selector", "receipt_id",
+              "can_start_new_attempt", "new_attempt_selector", "new_attempt_url")
     value = {key: form.get(key) for key in fields}
     value.update(action=safe_public_url(form["action"]),
                  existing_files=sorted(form.get("existing_files", [])),
@@ -27,12 +28,14 @@ def _snapshot(form: dict, detail) -> str:
 
 
 class Submitter:
-    def __init__(self, service, *, clock=time.monotonic):
+    def __init__(self, service, *, clock=time.monotonic,
+                 receipt_poll_delays=(0, 0.5, 1, 2, 3)):
         self.service = service
         self.session = service.session
         self.clock = clock
         self.pending: dict[str, dict] = {}
         self.lock = asyncio.Lock()
+        self.receipt_poll_delays = receipt_poll_delays
 
     async def _target(self, course_query, assignment_query):
         course = await self.service.select_course(course_query)
@@ -45,15 +48,17 @@ class Submitter:
         response = await self.session.get(assignment.url)
         form = submission_form(response.text, str(response.url))
         detail = parse_assignment_detail(response.text, str(response.url), course.id, assignment.id, assignment.name)
-        self._validate(form, course.id, assignment.id)
+        self._validate(form, course.id, assignment.id, allow_new_attempt=True)
         return course, assignment, form, detail
 
     @staticmethod
-    def _validate(form, course_id, assignment_id):
+    def _validate(form, course_id, assignment_id, *, allow_new_attempt=False):
         if form.get("is_group") or form.get("is_test"):
             raise BBError("unsupported_assignment", "首版只支持个人标准文件作业。")
         if form.get("course_id") != course_id or form.get("assignment_id") != assignment_id:
             raise BBError("target_mismatch", "提交页面与选定的课程或作业不一致，已停止。")
+        if allow_new_attempt and form.get("can_start_new_attempt"):
+            return
         if not form.get("can_submit") or not form.get("submit_selector"):
             raise BBError("submission_unavailable", "未发现可用的文件上传及提交表单；可能已截止、已交且不允许再次提交，或页面结构变化。")
 
@@ -83,6 +88,7 @@ class Submitter:
                 "filename": path.name, "bytes": len(payload), "sha256": checksum,
                 "comment": comment, "existing_files": form.get("existing_files", []),
                 "existing_attempt_id": form.get("attempt_id"), "can_submit": True,
+                "starts_new_attempt": bool(form.get("can_start_new_attempt") and not form.get("can_submit")),
                 "submission_url": safe_public_url(form["action"]),
             }
             if not confirm:
@@ -131,7 +137,7 @@ class Submitter:
                         raise BBError("session_expired", "浏览器会话失效，请重新登录并预览。")
                     form = submission_form(html, page.url)
                     detail = parse_assignment_detail(html, page.url, course.id, assignment.id, assignment.name)
-                    self._validate(form, course.id, assignment.id)
+                    self._validate(form, course.id, assignment.id, allow_new_attempt=True)
                     if _snapshot(form, detail) != _snapshot(original_form, original_detail):
                         raise BBError("preview_changed", "浏览器中的提交条件已改变，请重新预览。")
                     action = urlsplit(form["action"])
@@ -139,6 +145,28 @@ class Submitter:
                         raise BBError("unsafe_target", "提交表单指向了其他站点，已停止。")
                     if not urlsplit(assignment.url).path.startswith("/webapps/assignment/") or not action.path.startswith("/webapps/assignment/"):
                         raise BBError("unsupported_assignment", "未识别到标准 Blackboard 作业表单。")
+                    if form.get("can_start_new_attempt") and not form.get("can_submit"):
+                        if self.session.identity != expected_identity:
+                            raise BBError("preview_changed", "创建新尝试前账号会话发生变化，请重新预览。")
+                        previous_attempt = form.get("attempt_id")
+                        self.pending.pop(token, None)
+                        wrote = True  # Blackboard creates attempts through a GET action.
+                        await page.goto(form["new_attempt_url"], wait_until="domcontentloaded")
+                        html = await page.content()
+                        if is_login_page(html, page.url):
+                            raise BBError("session_expired", "创建新尝试时会话失效，未上传文件。")
+                        form = submission_form(html, page.url)
+                        detail = parse_assignment_detail(html, page.url, course.id, assignment.id, assignment.name)
+                        self._validate(form, course.id, assignment.id)
+                        if (form.get("has_receipt") or form.get("attempt_id") == previous_attempt
+                            or detail.requirements != original_detail.requirements
+                            or (original_detail.due_at and detail.due_at != original_detail.due_at)):
+                            raise BBError("preview_changed", "新尝试的标识或作业条件不符合预览，未上传文件。")
+                        action = urlsplit(form["action"])
+                        if ((action.scheme, action.netloc) != (base.scheme, base.netloc)
+                            or not action.path.startswith("/webapps/assignment/")):
+                            raise BBError("unsafe_target", "新尝试的提交表单不在当前作业站点，未上传文件。")
+                        original_form = {**form, "previous_attempt_id": previous_attempt}
                     if comment:
                         comment_selector = form.get("comment_input")
                         if not comment_selector or await page.locator(comment_selector).count() != 1:
@@ -173,9 +201,10 @@ class Submitter:
                     await page.wait_for_load_state("domcontentloaded")
                     if self.session.identity != expected_identity:
                         return await self._uncertain(assignment, filename, original_form, payload, expected_identity)
-                    await self.session.update_cookies(await context.storage_state())
+                    await self.session.update_cookies({"cookies": await context.cookies(), "origins": []})
                     verify_identity = self.session.identity
-                    receipt = await self._verify_receipt(page, course.id, assignment.id, filename, original_form, payload, verify_identity)
+                    receipt = await self._verify_receipt(page, course.id, assignment.id, filename, original_form, payload, verify_identity,
+                                                         history_url=assignment.url)
                     if receipt:
                         return Result(message="作业已提交，已回读并核验提交记录。", data={"submitted": True, "course_id": course.id, "assignment_id": assignment.id, "filename": filename, **receipt})
                     return await self._uncertain(assignment, filename, original_form, payload, verify_identity)
@@ -201,6 +230,7 @@ class Submitter:
         attempt_matches = bool(info.get("attempt_id")) and (
             info["attempt_id"] == expected_attempt if expected_attempt else True
         )
+        attempt_matches = attempt_matches and info.get("attempt_id") != before.get("previous_attempt_id")
         return (correct_target and before.get("can_submit") and not before.get("has_receipt")
                 and filename in info.get("existing_files", []) and info.get("has_receipt")
                 and attempt_matches)
@@ -220,18 +250,29 @@ class Submitter:
                 continue
         return False
 
-    async def _verify_receipt(self, page, course_id, assignment_id, filename, before, payload, identity):
+    async def _verify_receipt(self, page, course_id, assignment_id, filename, before, payload, identity,
+                              *, history_url):
         # Read actual history even when the immediate response is a generic success banner.
         info = submission_form(await page.content(), page.url)
-        candidates = [page.url, *info.get("history_links", [])]
-        for url in dict.fromkeys(candidates):
-            try:
-                response = await self.session.get(url)
-                current = submission_form(response.text, str(response.url))
-                if await self._verified_info(current, course_id, assignment_id, filename, before, payload, identity):
-                    return {"attempt_id": current.get("attempt_id"), "receipt_id": current.get("receipt_id"), "sha256": hashlib.sha256(payload).hexdigest(), "history_url": safe_public_url(str(response.url))}
-            except BBError:
-                continue
+        candidates = [history_url, page.url, *info.get("history_links", [])]
+        # A post-submit page can still have action=newAttempt/submit in its URL.
+        # Replaying such a GET is a write, never a receipt read.
+        candidates = [url for url in dict.fromkeys(candidates)
+                      if parse_qs(urlsplit(url).query).get("action", [""])[0].casefold()
+                      in {"", "showhistory", "reviewassignment", "viewattempts"}]
+        for delay in self.receipt_poll_delays:
+            if self.session.identity != identity:
+                return None
+            if delay:
+                await asyncio.sleep(delay)
+            for url in candidates:
+                try:
+                    response = await self.session.get(url)
+                    current = submission_form(response.text, str(response.url))
+                    if await self._verified_info(current, course_id, assignment_id, filename, before, payload, identity):
+                        return {"attempt_id": current.get("attempt_id"), "receipt_id": current.get("receipt_id"), "sha256": hashlib.sha256(payload).hexdigest(), "history_url": safe_public_url(str(response.url))}
+                except BBError:
+                    continue
         return None
 
     async def _uncertain(self, assignment, filename, before, payload, identity):

@@ -9,6 +9,7 @@ from mock_bb import MockBlackboard
 from ustc_bb_mcp.config import Settings
 from ustc_bb_mcp.errors import BBError
 from ustc_bb_mcp.models import Assignment, Course
+from ustc_bb_mcp.parsing import submission_form
 from ustc_bb_mcp.submission import Submitter
 
 
@@ -68,7 +69,7 @@ async def rig(mock_bb, tmp_path):
 
     service = SimpleNamespace(session=session, settings=settings, select_course=select_course, scan=scan)
     now = [1000.0]
-    submitter = Submitter(service, clock=lambda: now[0])
+    submitter = Submitter(service, clock=lambda: now[0], receipt_poll_delays=(0, 0, 0))
     path = tmp_path / "fictional-report.txt"
     path.write_text("Fictional local report.\n", encoding="utf-8")
     yield SimpleNamespace(server=mock_bb, session=session, service=service, submitter=submitter,
@@ -128,6 +129,99 @@ async def test_same_attempt_transitions_to_submitted_without_separate_receipt_id
     assert len(rig.server.state.posts) == 1
     assert rig.server.state.download_requests
     assert all(request["attempt_id"] == "_10_1" for request in rig.server.state.download_requests)
+
+
+async def test_delayed_receipt_is_read_again_without_reposting(rig):
+    rig.server.state.history_delay_reads = 4
+    token = (await preview(rig)).data["preview_token"]
+    result = await confirm(rig, token)
+    assert result.ok and result.data["submitted"] is True
+    assert rig.server.state.history_reads >= 5
+    assert len(rig.server.state.posts) == 1
+
+
+async def test_receipt_read_never_replays_new_attempt_get(rig):
+    before = submission_form(rig.server.form("_1_1", "_2_1"), rig.server.url())
+    rig.server.state.submitted = True
+    rig.server.state.allow_new_attempt = True
+    rig.server.state.accepted = {"files": [{"name": rig.path.name, "content": rig.path.read_bytes()}], "fields": {}}
+
+    async def content():
+        return rig.server.receipt("_1_1", "_2_1")
+
+    page = SimpleNamespace(url=rig.server.url() + "&action=newAttempt", content=content)
+    receipt = await rig.submitter._verify_receipt(page, "_1_1", "_2_1", rig.path.name,
+                                                 before, rig.path.read_bytes(), rig.session.identity,
+                                                 history_url=rig.server.url())
+    assert receipt["attempt_id"] == "_20_1"
+    assert rig.server.state.new_attempts == 0 and rig.server.state.posts == []
+
+
+def existing_submission(rig):
+    state = rig.server.state
+    state.submitted = True
+    state.allow_new_attempt = True
+    state.accepted = {"files": [{"name": rig.path.name, "content": rig.path.read_bytes()}], "fields": {}}
+
+
+async def test_resubmission_preview_does_not_create_attempt_or_upload(rig):
+    existing_submission(rig)
+    result = await preview(rig)
+    assert result.ok and result.data["starts_new_attempt"]
+    assert result.data["existing_attempt_id"] == "_20_1"
+    assert result.data["existing_files"] == [rig.path.name]
+    assert rig.server.state.new_attempts == 0
+    assert rig.server.state.posts == []
+
+
+async def test_confirmed_resubmission_creates_once_and_verifies_new_attempt(rig):
+    existing_submission(rig)
+    token = (await preview(rig)).data["preview_token"]
+    result = await confirm(rig, token, comment="")
+    assert result.ok and result.data["submitted"] is True
+    assert result.data["attempt_id"] == "_21_1"
+    assert rig.server.state.new_attempts == 1
+    assert len(rig.server.state.posts) == 1
+    assert rig.server.state.posts[0]["files"][0]["content"] == rig.path.read_bytes()
+    assert rig.server.state.download_requests
+    assert all(request["attempt_id"] == "_21_1" for request in rig.server.state.download_requests)
+
+
+async def test_resubmission_permission_change_stops_before_creating_attempt(rig):
+    existing_submission(rig)
+    token = (await preview(rig)).data["preview_token"]
+    rig.server.state.enabled = False
+    with pytest.raises(BBError) as failure:
+        await confirm(rig, token)
+    assert failure.value.code == "submission_unavailable"
+    assert rig.server.state.new_attempts == 0 and rig.server.state.posts == []
+
+
+@pytest.mark.parametrize("change", ["target", "requirements"])
+async def test_new_attempt_is_revalidated_before_file_upload(rig, change):
+    existing_submission(rig)
+    token = (await preview(rig)).data["preview_token"]
+    if change == "target":
+        rig.server.state.form_assignment_id = "_77_1"
+    else:
+        rig.server.state.browser_changed = True
+    result = await confirm(rig, token)
+    assert not result.ok and result.data["submitted"] is None
+    assert rig.server.state.new_attempts == 1 and rig.server.state.posts == []
+    assert token not in rig.submitter.pending
+
+
+@pytest.mark.parametrize("behavior,uploads", [("new_attempt_old_history", 0), ("resubmit_old_receipt", 1)])
+async def test_resubmission_cannot_use_old_identical_attachment_as_receipt(rig, behavior, uploads):
+    existing_submission(rig)
+    rig.server.state.behavior = behavior
+    token = (await preview(rig)).data["preview_token"]
+    result = await confirm(rig, token)
+    assert not result.ok and result.data["submitted"] is None
+    assert result.error["code"] == "submission_unknown"
+    assert rig.server.state.new_attempts == 1
+    assert len(rig.server.state.posts) == uploads
+    assert token not in rig.submitter.pending
 
 
 @pytest.mark.parametrize("behavior", ["wrong_attachment_bytes", "old_attempt_same_name"])

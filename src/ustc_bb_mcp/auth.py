@@ -43,7 +43,13 @@ async def _browser_route(route) -> None:
         await route.abort()
         return
     if part.scheme == "http" and part.hostname in allowed:
-        await route.continue_(url=urlunsplit(("https", part.netloc, part.path, part.query, part.fragment)))
+        # Playwright cannot change a request's protocol via continue_. Use an
+        # actual redirect so legacy CAS callbacks reach HTTPS without hanging.
+        await route.fulfill(
+            status=307,
+            headers={"Location": urlunsplit(("https", part.netloc, part.path, part.query, part.fragment))},
+            body="",
+        )
         return
     if part.scheme != "https":
         await route.abort()
@@ -59,6 +65,8 @@ async def _browser_route(route) -> None:
 
 async def _advance_login_entry(page) -> None:
     """Follow only the known read-only login links, never submit a CAS form."""
+    from playwright.async_api import Error as PlaywrightError
+
     part = urlsplit(page.url)
     if part.hostname not in BB_HOSTS:
         return
@@ -68,13 +76,14 @@ async def _advance_login_entry(page) -> None:
         name = re.compile(r"统一身份认证|Single Sign.?On|SSO", re.IGNORECASE)
     else:
         return
-    link = page.get_by_role("link", name=name)
-    if await link.count() and await link.first.is_visible():
-        try:
+    try:
+        link = page.get_by_role("link", name=name)
+        if await link.count() and await link.first.is_visible():
             await link.first.click(timeout=5000)
-        except Exception:
-            # A navigation race leaves the visible window available to the user.
-            pass
+    except PlaywrightError:
+        # Navigation can replace the document during count/visibility checks as
+        # well as during click. Keep the authentication window available.
+        pass
 
 
 class Session:
@@ -468,45 +477,86 @@ class Session:
             raise BBError("session_expired", "BB 会话失效，请重新登录后下载。")
 
     async def login_browser(self) -> dict:
+        from playwright.async_api import Error as PlaywrightError
         from playwright.async_api import async_playwright
 
         self.settings.profile_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        stage = "browser_launch"
         try:
             async with async_playwright() as playwright:
                 context = await playwright.chromium.launch_persistent_context(
                     str(self.settings.profile_dir), headless=False, locale="zh-CN", service_workers="block"
                 )
                 try:
+                    stage = "browser_setup"
                     await context.route("**/*", _browser_route)
                     state = await self.storage_state()
                     if state["cookies"]:
                         await context.add_cookies(state["cookies"])
                     page = context.pages[0] if context.pages else await context.new_page()
-                    await page.goto(self.settings.base_url + "/", wait_until="domcontentloaded", timeout=45000)
-                    advanced: set[str] = set()
+                    stage = "initial_navigation"
+                    try:
+                        await page.goto(self.settings.base_url + "/", wait_until="domcontentloaded", timeout=45000)
+                    except PlaywrightError:
+                        if not context.pages:
+                            raise BBError("login_cancelled", "登录窗口已关闭，未更新会话。") from None
+                        # A popup or navigation handoff may replace the initial
+                        # page. Do not close the remaining authentication pages.
+                    advanced: set[tuple[str | None, str]] = set()
+                    last_probe_error = None
                     deadline = time.monotonic() + 300
                     while time.monotonic() < deadline:
                         if not context.pages:
                             raise BBError("login_cancelled", "登录窗口已关闭，未更新会话。")
-                        for current_page in context.pages:
-                            if current_page.url not in advanced and len(advanced) < 6:
-                                advanced.add(current_page.url)
+                        stage = "login_entry"
+                        for current_page in list(context.pages):
+                            part = urlsplit(current_page.url)
+                            entry = (part.hostname, part.path.rstrip("/"))
+                            if (part.hostname in BB_HOSTS
+                                and (entry[1] in {"", "/webapps/login"} or part.path.startswith("/nginx_auth"))
+                                and entry not in advanced):
+                                # Query changes must not click the same login
+                                # entry again and create another authentication tab.
+                                advanced.add(entry)
                                 await _advance_login_entry(current_page)
                         await asyncio.sleep(2)
-                        state = await context.storage_state()
+                        stage = "browser_state"
+                        try:
+                            # storage_state() may open temporary pages for origins
+                            # left behind by SSO. Poll cookies without creating tabs.
+                            state = {"cookies": await context.cookies(), "origins": []}
+                        except PlaywrightError:
+                            if not context.pages:
+                                raise BBError("login_cancelled", "登录窗口已关闭，未更新会话。") from None
+                            continue
                         self.client.cookies.clear()
                         self._import_cookies(state)
-                        if await self._probe():
+                        stage = "session_probe"
+                        try:
+                            authenticated = await self._probe()
+                        except BBError as error:
+                            if error.code not in {"network_error", "http_error", "session_expired"}:
+                                raise
+                            last_probe_error = error.code
+                            continue
+                        if authenticated:
                             self._authenticated = True
+                            stage = "session_save"
                             await self._save_state()
                             return {"authenticated": True, "method": "browser"}
-                    raise BBError("login_timeout", "浏览器登录等待超过 5 分钟，请重新运行 login --browser。")
+                    raise BBError("login_timeout", "浏览器登录等待超过 5 分钟，请重新运行 login --browser。",
+                                  details={"last_probe_error": last_probe_error})
                 finally:
                     await context.close()
         except BBError:
             raise
         except Exception as exc:
-            raise BBError("browser_login_failed", "浏览器登录无法完成。请先运行 playwright install chromium，并关闭本项目已有的登录窗口，再重试 login --browser。") from exc
+            details = {"stage": stage, "exception_type": type(exc).__name__}
+            network_error = re.search(r"net::ERR_[A-Z0-9_]+", str(exc))
+            if network_error:
+                details["network_error"] = network_error[0]
+            raise BBError("browser_login_failed", "浏览器登录未完成，请根据失败阶段检查；未自动重新打开窗口。",
+                          details=details) from exc
 
     async def close(self) -> None:
         if self._owns_client:
